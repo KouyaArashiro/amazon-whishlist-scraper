@@ -1,16 +1,15 @@
 package main
 
 import (
+    "context"
     "fmt"
     "log"
-    "net/http"
     "os"
-    "strings"
-    "regexp"
+    //"regexp"
     "time"
 
+    "github.com/chromedp/chromedp"
     "github.com/joho/godotenv"
-    "github.com/PuerkitoBio/goquery"
 )
 
 type WishlistItem struct {
@@ -21,73 +20,105 @@ type WishlistItem struct {
 }
 
 func scrapeWishlist(wishlistID string) ([]WishlistItem, error) {
-    url := fmt.Sprintf("https://www.amazon.co.jp/hz/wishlist/ls/%s", wishlistID)
-    fmt.Printf("Scraping URL: %s\n", url)
+    log.Println("Starting scrapeWishlist function")
 
-    client := &http.Client{
-        Timeout: time.Second * 30,
-    }
+    opts := append(chromedp.DefaultExecAllocatorOptions[:],
+        chromedp.Flag("headless", true),
+        chromedp.Flag("no-sandbox", true),
+        chromedp.Flag("disable-gpu", true),
+        chromedp.Flag("disable-dev-shm-usage", true),
+    )
 
-    req, err := http.NewRequest("GET", url, nil)
-    if err != nil {
-        return nil, fmt.Errorf("error creating request: %v", err)
-    }
+    allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
+    defer cancel()
 
-    req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+    ctx, cancel := chromedp.NewContext(allocCtx, chromedp.WithLogf(log.Printf))
+    defer cancel()
 
-    resp, err := client.Do(req)
-    if err != nil {
-        return nil, fmt.Errorf("error making request: %v", err)
-    }
-    defer resp.Body.Close()
-
-    fmt.Printf("Response status: %s\n", resp.Status)
-
-    doc, err := goquery.NewDocumentFromReader(resp.Body)
-    if err != nil {
-        return nil, fmt.Errorf("error parsing HTML: %v", err)
-    }
+    ctx, cancel = context.WithTimeout(ctx, 5*time.Minute)
+    defer cancel()
 
     var items []WishlistItem
+    uniqueItems := make(map[string]bool) // ISBNをキーとして使用
 
-    doc.Find("li[data-id]").Each(func(i int, s *goquery.Selection) {
-        fmt.Printf("Processing item %d:\n", i+1)
+    err := chromedp.Run(ctx,
+        chromedp.Navigate(fmt.Sprintf("https://www.amazon.co.jp/hz/wishlist/ls/%s", wishlistID)),
+        chromedp.ActionFunc(func(ctx context.Context) error {
+            log.Println("Page loaded, waiting for #g-items")
+            return nil
+        }),
+        chromedp.WaitVisible(`#g-items`, chromedp.ByID),
+        chromedp.ActionFunc(func(ctx context.Context) error {
+            log.Println("#g-items found, starting to scroll and scrape")
+            return scrollAndScrape(ctx, &items, uniqueItems)
+        }),
+    )
 
-        // 修正されたタイトルセレクタ
-        title := s.Find("a[id^='itemName_']").Text()
+    if err != nil {
+        return nil, fmt.Errorf("error in chromedp.Run: %v", err)
+    }
 
-        price := s.Find(".a-price .a-offscreen").First().Text()
-        url, _ := s.Find("a[id^='itemName_']").Attr("href")
-        
-        // Extract ISBN
-        isbn := ""
-        re := regexp.MustCompile(`/dp/([A-Z0-9]{10})`)
-        if matches := re.FindStringSubmatch(url); len(matches) > 1 {
-            isbn = matches[1]
-        }
-
-        // Make URL absolute
-        fullURL := "https://www.amazon.co.jp" + url
-
-        fmt.Printf("Found item:\n")
-        fmt.Printf("  Title: %s\n", strings.TrimSpace(title))
-        fmt.Printf("  Price: %s\n", strings.TrimSpace(price))
-        fmt.Printf("  URL: %s\n", fullURL)
-        fmt.Printf("  ISBN: %s\n", isbn)
-        fmt.Println()
-
-        item := WishlistItem{
-            Title: strings.TrimSpace(title),
-            Price: strings.TrimSpace(price),
-            URL:   fullURL,
-            ISBN:  isbn,
-        }
-        items = append(items, item)
-    })
-
-    fmt.Printf("Total items found: %d\n", len(items))
-
+    log.Printf("Scraping completed. Total unique items found: %d\n", len(items))
     return items, nil
+}
+
+func scrollAndScrape(ctx context.Context, items *[]WishlistItem, uniqueItems map[string]bool) error {
+    var lastHeight int64
+    for {
+        var currentHeight int64
+        if err := chromedp.Evaluate(`document.documentElement.scrollHeight`, &currentHeight).Do(ctx); err != nil {
+            return fmt.Errorf("error getting page height: %v", err)
+        }
+
+        log.Printf("Current height: %d, Last height: %d\n", currentHeight, lastHeight)
+
+        if currentHeight == lastHeight {
+            log.Println("Reached end of page")
+            break
+        }
+
+        if err := chromedp.Evaluate(`window.scrollTo(0, document.documentElement.scrollHeight)`, nil).Do(ctx); err != nil {
+            return fmt.Errorf("error scrolling: %v", err)
+        }
+
+        time.Sleep(2 * time.Second)
+
+        var newItems []WishlistItem
+        err := chromedp.Evaluate(`
+            Array.from(document.querySelectorAll('li[data-id]')).map(item => {
+                let title = item.querySelector('a[id^="itemName_"]');
+                let price = item.querySelector('.a-price .a-offscreen');
+                let url = title ? title.href : '';
+                let isbn = url.match(/\/dp\/(\d{10}|\d{13})/) ? url.match(/\/dp\/(\d{10}|\d{13})/)[1] : '';
+                return {
+                    Title: title ? title.textContent.trim() : '',
+                    Price: price ? price.textContent.trim() : '',
+                    URL: url,
+                    ISBN: isbn
+                };
+            })
+        `, &newItems).Do(ctx)
+
+        if err != nil {
+            return fmt.Errorf("error evaluating JavaScript: %v", err)
+        }
+
+        for _, item := range newItems {
+            if item.ISBN != "" && !uniqueItems[item.ISBN] {
+                uniqueItems[item.ISBN] = true
+                *items = append(*items, item)
+                log.Printf("Added new item: %s (ISBN: %s)\n", item.Title, item.ISBN)
+            } else if item.ISBN == "" {
+                log.Printf("Skipped non-book item: %s\n", item.Title)
+            } else {
+                log.Printf("Skipped duplicate item: %s (ISBN: %s)\n", item.Title, item.ISBN)
+            }
+        }
+
+        lastHeight = currentHeight
+    }
+
+    return nil
 }
 
 func main() {
@@ -101,12 +132,14 @@ func main() {
         log.Fatal("AMAZON_WISHLIST_ID is not set in .env file")
     }
 
+    log.Printf("Starting scraping for wishlist ID: %s\n", wishlistID)
+
     items, err := scrapeWishlist(wishlistID)
     if err != nil {
         log.Fatalf("Error scraping wishlist: %v", err)
     }
 
-    fmt.Printf("Total items scraped: %d\n\n", len(items))
+    log.Printf("Total unique items scraped: %d\n\n", len(items))
 
     for i, item := range items {
         fmt.Printf("Item %d:\n", i+1)
