@@ -13,12 +13,12 @@ import (
     _ "github.com/go-sql-driver/mysql"
 )
 
-type WishlistItem struct {
-    Title string
-    Price string
-    URL   string
-    ISBN  string
-}
+//type WishlistItem struct {
+//    Title string
+//    Price string
+//    URL   string
+//    ISBN  string
+//}
 
 func scrapeWishlist(wishlistID string) ([]WishlistItem, error) {
 log.Println("Starting scrapeWishlist function")
