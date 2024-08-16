@@ -1,7 +1,6 @@
 package main
 
 import (
-    "fmt"
     "log"
     "os"
 
@@ -32,11 +31,18 @@ func main() {
     if err != nil {
         log.Fatalf("Error saving to database: %v", err)
     }
-
+    
     log.Println("Data successfully saved to database")
 
-    for i, item := range items {
-        fmt.Printf("Item %d:\n", i+1)
-        fmt.Printf("Title: %s\nPrice: %s\nURL: %s\nISBN: %s\n\n", item.Title, item.Price, item.URL, item.ISBN)
+//    for i, item := range items {
+//        fmt.Printf("Item %d:\n", i+1)
+//        fmt.Printf("Title: %s\nPrice: %s\nURL: %s\nISBN: %s\n\n", item.Title, item.Price, item.URL, item.ISBN)
+//    }
+
+    err = SearchBooks(items)
+    if err != nil {
+        log.Fatalf("Error search to libraries: %v", err)
     }
+    
+
 }
